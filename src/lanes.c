@@ -52,7 +52,7 @@
  *      ...
  */
 
-char const* VERSION = "3.12";
+char const* VERSION = "3.13";
 
 /*
 ===============================================================================
@@ -430,7 +430,7 @@ struct s_Linda
 };
 #define LINDA_KEEPER_HASHSEED( linda) (linda->group ? linda->group : (ptrdiff_t)linda)
 
-static void* linda_id( lua_State*, enum eDeepOp);
+static void* linda_id( lua_State*, DeepOp);
 
 static inline struct s_Linda* lua_toLinda( lua_State* L, int idx_)
 {
@@ -1126,7 +1126,7 @@ LUAG_FUNC( linda_towatch)
 * For any other strings, the ID function must not react at all. This allows
 * future extensions of the system. 
 */
-static void* linda_id( lua_State* L, enum eDeepOp op_)
+static void* linda_id( lua_State* L, DeepOp op_)
 {
 	switch( op_)
 	{
@@ -1756,7 +1756,10 @@ static int selfdestruct_gc( lua_State* L)
 	// Locks for 'tools.c' inc/dec counters
 	MUTEX_FREE( &U->deep_lock);
 	MUTEX_FREE( &U->mtid_lock);
-
+	// universe is no longer available (nor necessary)
+	// we need to do this in case some deep userdata objects were created before Lanes was initialized,
+	// as potentially they will be garbage collected after Lanes at application shutdown
+	universe_store( L, NULL);
 	return 0;
 }
 
@@ -2286,6 +2289,7 @@ LUAG_FUNC( lane_new)
 				// require the module in the target state, and populate the lookup table there too
 				size_t len;
 				char const* name = lua_tolstring( L, -1, &len);
+				DEBUGSPEW_CODE( fprintf( stderr, INDENT_BEGIN "lane_new: require '%s'\n" INDENT_END, name));
 
 				// require the module in the target lane
 				lua_getglobal( L2, "require");                                                                                                       // require()?
@@ -2296,12 +2300,6 @@ LUAG_FUNC( lane_new)
 				}
 				else
 				{
-					// if is it "lanes" or "lanes.core", make sure we have copied the initial settings over
-					// which might not be the case if the libs list didn't include lanes.core or "*"
-					if( strncmp( name, "lanes.core", len) == 0) // this works both both "lanes" and "lanes.core" because of len
-					{
-						luaG_copy_one_time_settings( U, L, L2);
-					}
 					lua_pushlstring( L2, name, len);                                                                                                   // require() name
 					if( lua_pcall( L2, 1, 1, 0) != LUA_OK)                                                                                             // ret/errcode
 					{
@@ -3115,6 +3113,9 @@ LUAG_FUNC( configure)
 		lua_pop( L, 1);                                                                    // settings
 		lua_getfield( L, 1, "verbose_errors");                                             // settings verbose_errors
 		U->verboseErrors = lua_toboolean( L, -1);
+		lua_pop( L, 1);                                                                    // settings
+		lua_getfield( L, 1, "demote_full_userdata");                                       // settings demote_full_userdata
+		U->demoteFullUserdata = lua_toboolean( L, -1);
 		lua_pop( L, 1);                                                                    // settings
 #if HAVE_LANE_TRACKING
 		MUTEX_INIT( &U->tracking_cs);

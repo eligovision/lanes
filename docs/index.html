@@ -64,13 +64,13 @@
 		<font size="-1">
 			<p>
 				<br/>
-				<i>Copyright &copy; 2007-17 Asko Kauppi, Benoit Germain. All rights reserved.</i>
+				<i>Copyright &copy; 2007-18 Asko Kauppi, Benoit Germain. All rights reserved.</i>
 				<br/>
 				Lua Lanes is published under the same <a href="http://en.wikipedia.org/wiki/MIT_License">MIT license</a> as Lua 5.1, 5.2, and 5.3.
 			</p>
 
 			<p>
-				This document was revised on 1-Aug-17, and applies to version <tt>3.12</tt>.
+				This document was revised on 7-Nov-18, and applies to version <tt>3.13</tt>.
 			</p>
 		</font>
 	</center>
@@ -113,7 +113,7 @@
 
 	<ul>
 		<li>Coroutines are not passed between states.</li>
-		<li>Sharing full userdata between states needs special C side preparations (-&gt; <A HREF="#deep_userdata">deep userdata</A>).</li>
+		<li>Sharing full userdata between states needs special C side preparations (-&gt; <A HREF="#deep_userdata">deep userdata</A> and -&gt; <A HREF="#clonable_userdata">clonable userdata</A>).</li>
 		<li>Network level parallelism not included.</li>
 		<li>Multi-CPU is done with OS threads, not processes. A lane is a Lua full userdata, therefore it will exist only as long as the Lua state that created it still exists. Therefore, a lane won't continue execution after the main program's termination.</li>
 		<li>Just like independant Lua states, Lanes universes cannot communicate together.</li>
@@ -324,7 +324,7 @@
 				<tt>nil</tt>/<tt>false</tt>/<tt>true</tt>
 			</td>
 			<td>
-				(Since v3.5.2) If equal to <tt>true</tt>, Lanes wraps all calls to the state's allocator function inside a mutex. Useful when running Lanes with LuaJIT, whose allocator is not threadsafe.
+				(Since v3.5.2) If equal to <tt>true</tt>, Lanes wraps all calls to the state's allocator function inside a mutex. Since v3.6.3, when left unset, Lanes attempts to autodetect this value for LuaJIT (the guess might be wrong if <tt>"ffi"</tt> isn't loaded though).
 				Default is <tt>true</tt> when Lanes detects it is run by LuaJIT, else <tt>nil</tt>.
 			</td>
 		</tr>
@@ -1510,6 +1510,74 @@ events to a common Linda, but... :).</font>
 	}
 </pre></td></tr></table>
 
+<h3 id="clonable_userdata">Clonable full userdata in your own apps</h3>
+<p>
+	Starting with version 3.13, a new way of passing full userdata across lanes uses a new <tt>__lanesclone</tt> metamethod. A typical implementation would look like:
+<table border="1" bgcolor="#FFFFE0" cellpadding="10" style="width:50%"><tr><td><pre>
+static int clonable_lanesclone( lua_State* L)
+{
+	switch( lua_gettop( L))
+	{
+		case 0:
+		lua_pushinteger( L, sizeof( struct s_MyClonableUserdata));
+		return 1;
+
+		case 2:
+		{
+			struct s_MyClonableUserdata* self = lua_touserdata( L, 1);
+			struct s_MyClonableUserdata* from = lua_touserdata( L, 2);
+			*self = *from;
+			return 0;
+		}
+
+		default:
+		(void) luaL_error( L, "Lanes called clonable_lanesclone with unexpected parameters");
+	}
+	return 0;
+}
+</pre></td></tr></table>
+</p>
+
+<p>
+	Of course, more complex objects may require smarter cloning behavior than a simple <tt>memcpy</tt>. Also, the module initialisation code should make each metatable accessible from the module table itself as in:
+<table border="1" bgcolor="#FFFFE0" cellpadding="10" style="width:50%"><tr><td><pre>
+int luaopen_deep_test(lua_State* L)
+{
+	luaL_newlib( L, deep_module);
+
+	// preregister the metatables for the types we can instanciate so that Lanes can know about them
+	if( luaL_newmetatable( L, "clonable"))
+	{
+		luaL_setfuncs( L, clonable_mt, 0);
+		lua_pushvalue(L, -1);
+		lua_setfield(L, -2, "__index");
+	}
+	lua_setfield(L, -2, "__clonableMT"); // actual name is not important
+
+	if( luaL_newmetatable( L, "deep"))
+	{
+		luaL_setfuncs( L, deep_mt, 0);
+		lua_pushvalue(L, -1);
+		lua_setfield(L, -2, "__index");
+	}
+	lua_setfield(L, -2, "__deepMT"); // actual name is not important
+
+	return 1;
+}
+</pre></td></tr></table>
+</p>
+
+<p>
+	Then a new clonable userdata instance can just do like any non-Lanes aware userdata, as long as its metatable contains the aforementionned <tt>__lanesclone</tt> method. Note that the current implementation doesn't support uservalues on such userdata.
+<table border="1" bgcolor="#FFFFE0" cellpadding="10" style="width:50%"><tr><td><pre>
+int luaD_new_clonable( lua_State* L)
+{
+	lua_newuserdata( L, sizeof( struct s_MyClonableUserdata));
+	luaL_setmetatable( L, "clonable");
+	return 1;
+}
+</pre></td></tr></table>
+</p>
 
 <h3 id="deep_userdata">Deep userdata in your own apps</h3>
 
@@ -1520,7 +1588,7 @@ events to a common Linda, but... :).</font>
 <ol>
 	<li>
 		Provide an <i>identity function</i> for your userdata, in C. This function is used for creation and deletion of your deep userdata (the shared resource), and for making metatables for the state-specific proxies for accessing it. The prototype is
-		<table border="1" bgcolor="#E0E0FF" cellpadding="10" style="width:50%"><tr><td><pre>	void* idfunc( lua_State* L, enum eDeepOp op_);</pre></td></tr></table>
+		<table border="1" bgcolor="#E0E0FF" cellpadding="10" style="width:50%"><tr><td><pre>	void* idfunc( lua_State* L, DeepOp op_);</pre></td></tr></table>
 		<tt>op_</tt> can be one of:
 		<ul>
 			<li><tt>eDO_new</tt>: requests the creation of a new object, whose pointer is returned.</li>

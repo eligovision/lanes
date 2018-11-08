@@ -28,6 +28,8 @@ THE SOFTWARE.
 ===============================================================================
 */
 
+#include <string.h>
+
 #include "universe.h"
 #include "compat.h"
 #include "macros_and_utils.h"
@@ -54,7 +56,14 @@ void universe_store( lua_State* L, Universe* U)
 {
 	STACK_CHECK( L);
 	push_unique_key( L, UNIVERSE_REGKEY);
-	lua_pushlightuserdata( L, U);
+	if( NULL != U)
+	{
+		lua_pushlightuserdata( L, U);
+	}
+	else
+	{
+		lua_pushnil( L);
+	}
 	lua_rawset( L, LUA_REGISTRYINDEX);
 	STACK_END( L, 0);
 }

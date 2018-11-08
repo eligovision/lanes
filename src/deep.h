@@ -36,8 +36,9 @@ enum eDeepOp
 	eDO_metatable,
 	eDO_module,
 };
+typedef enum eDeepOp DeepOp;
 
-typedef void* (*luaG_IdFunction)( lua_State* L, enum eDeepOp op_);
+typedef void* (*luaG_IdFunction)( lua_State* L, DeepOp op_);
 
 // ################################################################################################
 
