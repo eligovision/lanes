@@ -2178,7 +2178,10 @@ LUAG_FUNC( configure)
 	lua_pushcclosure( L, LG_require, 1);                                                 // settings M lanes.require
 	lua_setfield( L, -2, "require");                                                     // settings M
 
-	lua_pushstring(L, lanes_get_version());                                              // settings M VERSION (MAJOR.MINOR.PATCH format)
+	lua_pushfstring(
+		L, "%d.%d.%d"
+		, LANES_VERSION_MAJOR, LANES_VERSION_MINOR, LANES_VERSION_PATCH
+	);                                                                                   // settings M VERSION
 	lua_setfield( L, -2, "version");                                                     // settings M
 
 	lua_pushinteger(L, THREAD_PRIO_MAX);                                                 // settings M THREAD_PRIO_MAX
@@ -2268,20 +2271,6 @@ static void EnableCrashingOnCrashes( void)
 	}
 }
 #endif // PLATFORM_WIN32
-
-const char* LANES_API lanes_get_version()
-{
-	static char version[256];
-	static int version_init = 1;
-
-	if (version_init)
-	{
-		sprintf(version, "%d.%d.%d", LANES_VERSION_MAJOR, LANES_VERSION_MINOR, LANES_VERSION_PATCH);
-		version_init = 0;
-	}
-
-	return version;
-}
 
 int LANES_API luaopen_lanes_core( lua_State* L)
 {
