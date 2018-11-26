@@ -67,10 +67,6 @@ lanes.configure = function( settings_)
 	local tostring = assert( tostring)
 	local error = assert( error)
 
-	if package.loaded.jit and not package.loaded.ffi then
-		package.loaded.ffi = require("ffi")
-	end
-
 	local default_params =
 	{
 		nb_keepers = 1,
