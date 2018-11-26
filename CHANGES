@@ -1,5 +1,37 @@
 CHANGES:
 
+CHANGE 141: BGe 25-Nov-18
+   * protect_allocator configure option is gone, long live allocator (more embedders-friendly)
+
+CHANGE 140: BGe 22-Nov-18
+   * Raise an error instead of crashing when attempting to transfer a non-deep full userdata
+
+CHANGE 139: BGe 21-Nov-18
+   * more DEBUGSPEW
+
+CHANGE 138: BGe 19-Nov-18
+   * Registry access code utility macros
+   * CONFIG_REGKEY and LOOKUP_REGKEY are now lightuserdata instead of strings
+   * Stack checking debug macros improvements
+
+CHANGE 137: BGe 15-Nov-18
+   * Deep userdata must embed DeepPrelude to save an allocation (also changes Deep protocol)
+
+CHANGE 136: BGe 15-Nov-18
+   * split linda code in a separate file
+   * rockspec for version v3.13.0
+
+CHANGE 135: BGe 11-Nov-18
+   * fix a bunch of compilation warnings
+
+CHANGE 134: BGe 3-Dec-13
+   * new API lanes.set_thread_affinity()
+   * set_debug_threadname implemented with win32 pthread
+
+CHANGE 133: BGe 8-Nov-18
+   * Make sure any linda operation that can raise an error won't ever leave a mutex unreleased
+   * lane:join() now returns nil, "timeout" in case of timeout
+
 CHANGE 132: BGe 7-Nov-18
    * __lanesclone mechanism should actually work now
 

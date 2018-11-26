@@ -32,6 +32,7 @@ THE SOFTWARE.
 */
 
 #include <stdio.h>
+#include <assert.h>
 #include <string.h>
 #include <ctype.h>
 #include <stdlib.h>
@@ -50,14 +51,11 @@ THE SOFTWARE.
 extern bool_t copydeep( Universe* U, lua_State* L, lua_State* L2, int index, LookupMode mode_);
 extern void push_registry_subtable( lua_State* L, void* key_);
 
-char const* const CONFIG_REGKEY = "ee932492-a654-4506-9da8-f16540bdb5d4";
-char const* const LOOKUP_REGKEY = "ddea37aa-50c7-4d3f-8e0b-fb7a9d62bac5";
-
 DEBUGSPEW_CODE( char const* debugspew_indent = "----+----!----+----!----+----!----+----!----+----!----+----!----+----!----+");
 
 
 /*---=== luaG_dump ===---*/
-
+#ifdef _DEBUG
 void luaG_dump( lua_State* L)
 {
 	int top = lua_gettop( L);
@@ -79,7 +77,7 @@ void luaG_dump( lua_State* L)
 		// Note: this requires 'tostring()' to be defined. If it is NOT,
 		//       enable it for more debugging.
 		//
-		STACK_CHECK( L);
+		STACK_CHECK( L, 0);
 		STACK_GROW( L, 2);
 
 		lua_getglobal( L, "tostring");
@@ -105,10 +103,84 @@ void luaG_dump( lua_State* L)
 	}
 	fprintf( stderr, "\n");
 }
+#endif // _DEBUG
+
+// ################################################################################################
+
+static void* protected_lua_Alloc( void *ud, void *ptr, size_t osize, size_t nsize)
+{
+	void* p;
+	ProtectedAllocator* s = (ProtectedAllocator*) ud;
+	MUTEX_LOCK( &s->lock);
+	p = s->definition.allocF( s->definition.allocUD, ptr, osize, nsize);
+	MUTEX_UNLOCK( &s->lock);
+	return p;
+}
+
+static int luaG_provide_protected_allocator( lua_State* L)
+{
+	Universe* U = universe_get( L);
+	AllocatorDefinition* def = lua_newuserdata( L, sizeof(AllocatorDefinition));
+	def->allocF = protected_lua_Alloc;
+	def->allocUD = &U->protected_allocator;
+	return 1;
+}
+
+// Do I need to disable this when compiling for LuaJIT to prevent issues?
+void initialize_allocator_function( Universe* U, lua_State* L)
+{
+	STACK_CHECK( L, 0);
+	lua_getfield( L, -1, "allocator");                    // settings allocator|nil|"protected"
+	if( !lua_isnil( L, -1))
+	{
+		// store C function pointer in an internal variable
+		U->provide_allocator = lua_tocfunction( L, -1);     // settings allocator
+		if( U->provide_allocator != NULL)
+		{
+			// make sure the function doesn't have upvalues
+			char const* upname = lua_getupvalue( L, -1, 1);   // settings allocator upval?
+			if( upname != NULL) // should be "" for C functions with upvalues if any
+			{
+				(void) luaL_error( L, "config.allocator() shouldn't have upvalues");
+			}
+			// remove this C function from the config table so that it doesn't cause problems
+			// when we transfer the config table in newly created Lua states
+			lua_pushnil( L);                                  // settings allocator nil
+			lua_setfield( L, -3, "allocator");                // settings allocator
+		}
+		else if( lua_type( L, -1) == LUA_TSTRING)
+		{
+			// initialize all we need for the protected allocator
+			MUTEX_INIT( &U->protected_allocator.lock); // the mutex
+			// and the original allocator to call from inside protection by the mutex
+			U->protected_allocator.definition.allocF = lua_getallocf( L, &U->protected_allocator.definition.allocUD);
+			// before a state is created, this function will be called to obtain the allocator
+			U->provide_allocator = luaG_provide_protected_allocator;
+
+			lua_setallocf( L, protected_lua_Alloc, &U->protected_allocator);
+		}
+	}
+	lua_pop( L, 1);                                       // settings
+	STACK_END( L, 0);
+}
+
+void cleanup_allocator_function( Universe* U, lua_State* L)
+{
+	// remove the protected allocator, if any
+	if( U->protected_allocator.definition.allocF != NULL)
+	{
+		// install the non-protected allocator
+		lua_setallocf( L, U->protected_allocator.definition.allocF, U->protected_allocator.definition.allocUD);
+		// release the mutex
+		MUTEX_FREE( &U->protected_allocator.lock);
+	}
+}
+
+// ################################################################################################
 
 void initialize_on_state_create( Universe* U, lua_State* L)
 {
-	STACK_CHECK( L);
+	STACK_CHECK( L, 0);
 	lua_getfield( L, -1, "on_state_create");              // settings on_state_create|nil
 	if( !lua_isnil( L, -1))
 	{
@@ -142,14 +214,24 @@ void initialize_on_state_create( Universe* U, lua_State* L)
 // just like lua_xmove, args are (from, to)
 static void copy_one_time_settings( Universe* U, lua_State* L, lua_State* L2)
 {
-	STACK_GROW( L, 1);
+	STACK_GROW( L, 2);
+	STACK_CHECK( L, 0);
+	STACK_CHECK( L2, 0);
+
+	DEBUGSPEW_CODE( fprintf( stderr, INDENT_BEGIN "copy_one_time_settings()\n" INDENT_END));
+	DEBUGSPEW_CODE( ++ U->debugspew_indent_depth);
+
+	REGISTRY_GET( L, CONFIG_REGKEY);                                               // config
 	// copy settings from from source to destination registry
-	lua_getfield( L, LUA_REGISTRYINDEX, CONFIG_REGKEY);
-	if( luaG_inter_move( U, L, L2, 1, eLM_LaneBody) < 0) // error?
+	if( luaG_inter_move( U, L, L2, 1, eLM_LaneBody) < 0)                           //                           // config
 	{
 		(void) luaL_error( L, "failed to copy settings when loading lanes.core");
 	}
-	lua_setfield( L2, LUA_REGISTRYINDEX, CONFIG_REGKEY);
+	// set L2:_R[CONFIG_REGKEY] = settings
+	REGISTRY_SET( L2, CONFIG_REGKEY, lua_insert( L2, -2));                                                      //
+	STACK_END( L2, 0);
+	STACK_END( L, 0);
+	DEBUGSPEW_CODE( -- U->debugspew_indent_depth);
 }
 
 
@@ -199,7 +281,7 @@ static const luaL_Reg libs[] =
 	{ NULL, NULL }
 };
 
-static void open1lib( Universe* U, lua_State* L, char const* name_, size_t len_, lua_State* from_)
+static void open1lib( DEBUGSPEW_PARAM_COMMA( Universe* U) lua_State* L, char const* name_, size_t len_)
 {
 	int i;
 	for( i = 0; libs[i].name; ++ i)
@@ -212,7 +294,7 @@ static void open1lib( Universe* U, lua_State* L, char const* name_, size_t len_,
 			{
 				bool_t const isLanesCore = (libfunc == require_lanes_core) ? TRUE : FALSE; // don't want to create a global for "lanes.core"
 				DEBUGSPEW_CODE( fprintf( stderr, INDENT_BEGIN "opening %.*s library\n" INDENT_END, (int) len_, name_));
-				STACK_CHECK( L);
+				STACK_CHECK( L, 0);
 				// open the library as if through require(), and create a global as well if necessary (the library table is left on the stack)
 				luaL_requiref( L, name_, libfunc, !isLanesCore);
 				// lanes.core doesn't declare a global, so scan it here and now
@@ -291,17 +373,15 @@ static lua_CFunction luaG_tocfunction( lua_State *L, int _i, FuncSubType *_out)
 	return p;
 }
 
-
-#define LOOKUP_KEY "ddea37aa-50c7-4d3f-8e0b-fb7a9d62bac5"
-#define LOOKUP_KEY_CACHE "d1059270-4976-4193-a55b-c952db5ab7cd"
-
+// crc64/we of string "LOOKUPCACHE_REGKEY" generated at http://www.nitrxgen.net/hashgen/
+static DECLARE_CONST_UNIQUE_KEY( LOOKUPCACHE_REGKEY, 0x837a68dfc6fcb716);
 
 // inspired from tconcat() in ltablib.c
 static char const* luaG_pushFQN( lua_State* L, int t, int last, size_t* length)
 {
 	int i = 1;
 	luaL_Buffer b;
-	STACK_CHECK( L);
+	STACK_CHECK( L, 0);
 	luaL_buffinit( L, &b);
 	for( ; i < last; ++ i)
 	{
@@ -327,7 +407,7 @@ static char const* luaG_pushFQN( lua_State* L, int t, int last, size_t* length)
  * if we already had an entry of type [o] = ..., replace the name if the new one is shorter
  * pops the processed object from the stack
  */
-static void update_lookup_entry( lua_State* L, int _ctx_base, int _depth)
+static void update_lookup_entry( DEBUGSPEW_PARAM_COMMA( Universe* U) lua_State* L, int _ctx_base, int _depth)
 {
 	// slot 1 in the stack contains the table that receives everything we found
 	int const dest = _ctx_base;
@@ -337,9 +417,10 @@ static void update_lookup_entry( lua_State* L, int _ctx_base, int _depth)
 	size_t prevNameLength, newNameLength;
 	char const* prevName;
 	DEBUGSPEW_CODE( char const *newName);
-	DEBUGSPEW_CODE( Universe* U = universe_get( L));
+	DEBUGSPEW_CODE( fprintf( stderr, INDENT_BEGIN "update_lookup_entry()\n" INDENT_END));
+	DEBUGSPEW_CODE( ++ U->debugspew_indent_depth);
 
-	STACK_CHECK( L);
+	STACK_CHECK( L, 0);
 	// first, raise an error if the function is already known
 	lua_pushvalue( L, -1);                                                                // ... {bfc} k o o
 	lua_rawget( L, dest);                                                                 // ... {bfc} k o name?
@@ -397,9 +478,10 @@ static void update_lookup_entry( lua_State* L, int _ctx_base, int _depth)
 	}
 	-- _depth;
 	STACK_END( L, -1);
+	DEBUGSPEW_CODE( -- U->debugspew_indent_depth);
 }
 
-static void populate_func_lookup_table_recur( lua_State* L, int _ctx_base, int _i, int _depth)
+static void populate_func_lookup_table_recur( DEBUGSPEW_PARAM_COMMA( Universe* U) lua_State* L, int _ctx_base, int _i, int _depth)
 {
 	lua_Integer visit_count;
 	// slot 2 contains a table that, when concatenated, produces the fully qualified name of scanned elements in the table provided at slot _i
@@ -408,11 +490,12 @@ static void populate_func_lookup_table_recur( lua_State* L, int _ctx_base, int _
 	int const cache = _ctx_base + 2;
 	// we need to remember subtables to process them after functions encountered at the current depth (breadth-first search)
 	int const breadth_first_cache = lua_gettop( L) + 1;
-	DEBUGSPEW_CODE( Universe* U = universe_get( L));
+	DEBUGSPEW_CODE( fprintf( stderr, INDENT_BEGIN "populate_func_lookup_table_recur()\n" INDENT_END));
+	DEBUGSPEW_CODE( ++ U->debugspew_indent_depth);
 
 	STACK_GROW( L, 6);
 	// slot _i contains a table where we search for functions (or a full userdata with a metatable)
-	STACK_CHECK( L);                                                                          // ... {_i}
+	STACK_CHECK( L, 0);                                                                       // ... {_i}
 
 	// if object is a userdata, replace it by its metatable
 	if( lua_type( L, _i) == LUA_TUSERDATA)
@@ -429,6 +512,8 @@ static void populate_func_lookup_table_recur( lua_State* L, int _ctx_base, int _
 	STACK_MID( L, 0);
 	if( visit_count > 0)
 	{
+		DEBUGSPEW_CODE( fprintf( stderr, INDENT_BEGIN "already visited\n" INDENT_END));
+		DEBUGSPEW_CODE( -- U->debugspew_indent_depth);
 		return;
 	}
 
@@ -463,12 +548,12 @@ static void populate_func_lookup_table_recur( lua_State* L, int _ctx_base, int _
 			lua_pushvalue( L, -2);                                                                // ... {_i} {bfc} k {} k {}
 			lua_rawset( L, breadth_first_cache);                                                  // ... {_i} {bfc} k {}
 			// generate a name, and if we already had one name, keep whichever is the shorter
-			update_lookup_entry( L, _ctx_base, _depth);                                           // ... {_i} {bfc} k
+			update_lookup_entry( DEBUGSPEW_PARAM_COMMA( U) L, _ctx_base, _depth);                 // ... {_i} {bfc} k
 		}
 		else if( lua_isfunction( L, -1) && (luaG_getfuncsubtype( L, -1) != FST_Bytecode))       // ... {_i} {bfc} k func
 		{
 			// generate a name, and if we already had one name, keep whichever is the shorter
-			update_lookup_entry( L, _ctx_base, _depth);                                           // ... {_i} {bfc} k
+			update_lookup_entry( DEBUGSPEW_PARAM_COMMA( U) L, _ctx_base, _depth);                 // ... {_i} {bfc} k
 		}
 		else
 		{
@@ -503,7 +588,7 @@ static void populate_func_lookup_table_recur( lua_State* L, int _ctx_base, int _
 		// push table name in fqn stack (note that concatenation will crash if name is a not string!)
 		lua_pushvalue( L, -2);                                                                  // ... {_i} {bfc} k {} k
 		lua_rawseti( L, fqn, _depth);                                                           // ... {_i} {bfc} k {}
-		populate_func_lookup_table_recur( L, _ctx_base, lua_gettop( L), _depth);                // ... {_i} {bfc} k {}
+		populate_func_lookup_table_recur( DEBUGSPEW_PARAM_COMMA( U) L, _ctx_base, lua_gettop( L), _depth);
 		lua_pop( L, 1);                                                                         // ... {_i} {bfc} k
 		STACK_MID( L, 2);
 		DEBUGSPEW_CODE( -- U->debugspew_indent_depth);
@@ -516,6 +601,7 @@ static void populate_func_lookup_table_recur( lua_State* L, int _ctx_base, int _
 	lua_pop( L, 1);                                                                           // ... {_i}
 	STACK_END( L, 0);
 	// we are done                                                                            // ... {_i} {bfc}
+	DEBUGSPEW_CODE( -- U->debugspew_indent_depth);
 }
 
 /*
@@ -530,46 +616,47 @@ void populate_func_lookup_table( lua_State* L, int _i, char const* name_)
 	DEBUGSPEW_CODE( fprintf( stderr, INDENT_BEGIN "%p: populate_func_lookup_table('%s')\n" INDENT_END, L, name_ ? name_ : "NULL"));
 	DEBUGSPEW_CODE( ++ U->debugspew_indent_depth);
 	STACK_GROW( L, 3);
-	STACK_CHECK( L);
-	lua_getfield( L, LUA_REGISTRYINDEX, LOOKUP_REGKEY);                       // {}
+	STACK_CHECK( L, 0);
+	REGISTRY_GET( L, LOOKUP_REGKEY);                                               // {}
+	STACK_MID( L, 1);
 	ASSERT_L( lua_istable( L, -1));
 	if( lua_type( L, in_base) == LUA_TFUNCTION) // for example when a module is a simple function
 	{
 		name_ = name_ ? name_ : "NULL";
-		lua_pushvalue( L, in_base);                                             // {} f
-		lua_pushstring( L, name_);                                              // {} f _name
-		lua_rawset( L, -3);                                                     // {}
-		lua_pushstring( L, name_);                                              // {} _name
-		lua_pushvalue( L, in_base);                                             // {} _name f
-		lua_rawset( L, -3);                                                     // {}
-		lua_pop( L, 1);                                                         //
+		lua_pushvalue( L, in_base);                                                  // {} f
+		lua_pushstring( L, name_);                                                   // {} f _name
+		lua_rawset( L, -3);                                                          // {}
+		lua_pushstring( L, name_);                                                   // {} _name
+		lua_pushvalue( L, in_base);                                                  // {} _name f
+		lua_rawset( L, -3);                                                          // {}
+		lua_pop( L, 1);                                                              //
 	}
 	else if( lua_type( L, in_base) == LUA_TTABLE)
 	{
-		lua_newtable( L);                                                       // {} {fqn}
+		lua_newtable( L);                                                            // {} {fqn}
 		if( name_)
 		{
 			STACK_MID( L, 2);
-			lua_pushstring( L, name_);                                            // {} {fqn} "name"
+			lua_pushstring( L, name_);                                                 // {} {fqn} "name"
 			// generate a name, and if we already had one name, keep whichever is the shorter
 			lua_pushvalue( L, in_base);                                           // {} {fqn} "name" t
-			update_lookup_entry( L, ctx_base, start_depth);                       // {} {fqn} "name"
+			update_lookup_entry( DEBUGSPEW_PARAM_COMMA( U) L, ctx_base, start_depth);  // {} {fqn} "name"
 			// don't forget to store the name at the bottom of the fqn stack
 			++ start_depth;
-			lua_rawseti( L, -2, start_depth);                                     // {} {fqn}
+			lua_rawseti( L, -2, start_depth);                                          // {} {fqn}
 			STACK_MID( L, 2);
 		}
 		// retrieve the cache, create it if we haven't done it yet
-		lua_getfield( L, LUA_REGISTRYINDEX, LOOKUP_KEY_CACHE);                  // {} {fqn} {cache}?
+		REGISTRY_GET( L, LOOKUPCACHE_REGKEY);                                        // {} {fqn} {cache}?
 		if( lua_isnil( L, -1))
 		{
-			lua_pop( L, 1);                                                       // {} {fqn}
-			lua_newtable( L);                                                     // {} {fqn} {cache}
-			lua_pushvalue( L, -1);                                                // {} {fqn} {cache} {cache}
-			lua_setfield( L, LUA_REGISTRYINDEX, LOOKUP_KEY_CACHE);                // {} {fqn} {cache}
+			lua_pop( L, 1);                                                            // {} {fqn}
+			lua_newtable( L);                                                          // {} {fqn} {cache}
+			REGISTRY_SET( L, LOOKUPCACHE_REGKEY, lua_pushvalue( L, -2));
+			STACK_MID( L, 3);
 		}
 		// process everything we find in that table, filling in lookup data for all functions and tables we see there
-		populate_func_lookup_table_recur( L, ctx_base, in_base, start_depth);   // {...} {fqn} {cache}
+		populate_func_lookup_table_recur( DEBUGSPEW_PARAM_COMMA( U) L, ctx_base, in_base, start_depth);
 		lua_pop( L, 3);
 	}
 	else
@@ -585,12 +672,12 @@ void call_on_state_create( Universe* U, lua_State* L, lua_State* from_, LookupMo
 {
 	if( U->on_state_create_func != NULL)
 	{
-		STACK_CHECK( L);
+		STACK_CHECK( L, 0);
 		DEBUGSPEW_CODE( fprintf( stderr, INDENT_BEGIN "calling on_state_create()\n" INDENT_END));
 		if( U->on_state_create_func != (lua_CFunction) initialize_on_state_create)
 		{
 			// C function: recreate a closure in the new state, bypassing the lookup scheme
-			lua_pushcfunction( L, U->on_state_create_func);
+			lua_pushcfunction( L, U->on_state_create_func);                             // on_state_create()
 		}
 		else // Lua function located in the config table, copied when we opened "lanes.core"
 		{
@@ -600,10 +687,12 @@ void call_on_state_create( Universe* U, lua_State* L, lua_State* from_, LookupMo
 				// this doesn't count as an error though
 				return;
 			}
-			lua_getfield( L, LUA_REGISTRYINDEX, CONFIG_REGKEY);
-			lua_getfield( L, -1, "on_state_create");
-			lua_remove( L, -2);
+			REGISTRY_GET( L, CONFIG_REGKEY);                                            // {}
+			STACK_MID( L, 1);
+			lua_getfield( L, -1, "on_state_create");                                    // {} on_state_create()
+			lua_remove( L, -2);                                                         // on_state_create()
 		}
+		STACK_MID( L, 1);
 		// capture error and raise it in caller state
 		if( lua_pcall( L, 0, 0, 0) != LUA_OK)
 		{
@@ -611,6 +700,31 @@ void call_on_state_create( Universe* U, lua_State* L, lua_State* from_, LookupMo
 		}
 		STACK_END( L, 0);
 	}
+}
+
+lua_State* create_state( Universe* U, lua_State* from_)
+{
+	lua_State* L;
+	if( U->provide_allocator != NULL)
+	{
+		lua_pushcclosure( from_, U->provide_allocator, 0);
+		lua_call( from_, 0, 1);
+		{
+			AllocatorDefinition* def = lua_touserdata( from_, -1);
+			L = lua_newstate( def->allocF, def->allocUD);
+		}
+		lua_pop( from_, 1);
+	}
+	else
+	{
+		L = luaL_newstate();
+	}
+
+	if( L == NULL)
+	{
+		(void) luaL_error( from_, "luaG_newstate() failed while creating state; out of memory");
+	}
+	return L;
 }
 
 /*
@@ -628,28 +742,19 @@ void call_on_state_create( Universe* U, lua_State* L, lua_State* from_, LookupMo
  */
 lua_State* luaG_newstate( Universe* U, lua_State* from_, char const* libs_)
 {
-	// re-use alloc function from the originating state
-#if PROPAGATE_ALLOCF
-	PROPAGATE_ALLOCF_PREP( from_);
-#endif // PROPAGATE_ALLOCF
-	lua_State* L = PROPAGATE_ALLOCF_ALLOC();
-
-	if( L == NULL)
-	{
-		(void) luaL_error( from_, "luaG_newstate() failed while creating state; out of memory");
-	}
+	lua_State* L = create_state( U, from_);
 
 	STACK_GROW( L, 2);
+	STACK_CHECK_ABS( L, 0);
 
 	// copy the universe as a light userdata (only the master state holds the full userdata)
 	// that way, if Lanes is required in this new state, we'll know we are part of this universe
 	universe_store( L, U);
-
-	STACK_CHECK( L);
+	STACK_MID( L, 0);
 
 	// we'll need this every time we transfer some C function from/to this state
-	lua_newtable( L);
-	lua_setfield( L, LUA_REGISTRYINDEX, LOOKUP_REGKEY);
+	REGISTRY_SET( L, LOOKUP_REGKEY, lua_newtable( L));
+	STACK_MID( L, 0);
 
 	// neither libs (not even 'base') nor special init func: we are done
 	if( libs_ == NULL && U->on_state_create_func == NULL)
@@ -679,7 +784,7 @@ lua_State* luaG_newstate( Universe* U, lua_State* from_, char const* libs_)
 			DEBUGSPEW_CODE( fprintf( stderr, INDENT_BEGIN "opening ALL standard libraries\n" INDENT_END));
 			luaL_openlibs( L);
 			// don't forget lanes.core for regular lane states
-			open1lib( U, L, "lanes.core", 10, from_);
+			open1lib( DEBUGSPEW_PARAM_COMMA( U) L, "lanes.core", 10);
 			libs_ = NULL; // done with libs
 		}
 		else
@@ -713,18 +818,18 @@ lua_State* luaG_newstate( Universe* U, lua_State* from_, char const* libs_)
 			while( isalnum( p[len]) || p[len] == '.')
 				++ len;
 			// open library
-			open1lib( U, L, p, len, from_);
+			open1lib( DEBUGSPEW_PARAM_COMMA( U) L, p, len);
 		}
 	}
 	lua_gc( L, LUA_GCRESTART, 0);
 
-	serialize_require( U, L);
+	serialize_require( DEBUGSPEW_PARAM_COMMA( U) L);
 
 	// call this after the base libraries are loaded and GC is restarted
 	// will raise an error in from_ in case of problem
 	call_on_state_create( U, L, from_, eLM_LaneBody);
 
-	STACK_CHECK( L);
+	STACK_CHECK( L, 0);
 	// after all this, register everything we find in our name<->function database
 	lua_pushglobaltable( L); // Lua 5.2 no longer has LUA_GLOBALSINDEX: we must push globals table on the stack
 	populate_func_lookup_table( L, -1, NULL);
@@ -769,7 +874,7 @@ static uint_t get_mt_id( Universe* U, lua_State* L, int i)
 
 	STACK_GROW( L, 3);
 
-	STACK_CHECK( L);
+	STACK_CHECK( L, 0);
 	push_registry_subtable( L, REG_MTID);
 	lua_pushvalue( L, i);
 	lua_rawget( L, -2);
@@ -839,7 +944,7 @@ static char const* find_lookup_name( lua_State* L, uint_t i, LookupMode mode_, c
 	DEBUGSPEW_CODE( Universe* const U = universe_get( L));
 	char const* fqn;
 	ASSERT_L( lua_isfunction( L, i) || lua_istable( L, i));  // ... v ...
-	STACK_CHECK( L);
+	STACK_CHECK( L, 0);
 	STACK_GROW( L, 3); // up to 3 slots are necessary on error
 	if( mode_ == eLM_FromKeeper)
 	{
@@ -859,7 +964,8 @@ static char const* find_lookup_name( lua_State* L, uint_t i, LookupMode mode_, c
 	else
 	{
 		// fetch the name from the source state's lookup table
-		lua_getfield( L, LUA_REGISTRYINDEX, LOOKUP_REGKEY);    // ... v ... {}
+		REGISTRY_GET( L, LOOKUP_REGKEY);                       // ... v ... {}
+		STACK_MID( L, 1);
 		ASSERT_L( lua_istable( L, -1));
 		lua_pushvalue( L, i);                                  // ... v ... {} v
 		lua_rawget( L, -2);                                    // ... v ... {} "f.q.n"
@@ -915,7 +1021,7 @@ static bool_t lookup_table( lua_State* L2, lua_State* L, uint_t i, LookupMode mo
 		return FALSE;
 	}
 	// push the equivalent table in the destination's stack, retrieved from the lookup table
-	STACK_CHECK( L2);                                        // L                          // L2
+	STACK_CHECK( L2, 0);                                        // L                          // L2
 	STACK_GROW( L2, 3); // up to 3 slots are necessary on error
 	switch( mode_)
 	{
@@ -931,7 +1037,8 @@ static bool_t lookup_table( lua_State* L2, lua_State* L, uint_t i, LookupMode mo
 
 		case eLM_LaneBody:
 		case eLM_FromKeeper:
-		lua_getfield( L2, LUA_REGISTRYINDEX, LOOKUP_REGKEY);                                 // {}
+		REGISTRY_GET( L2, LOOKUP_REGKEY);                                                    // {}
+		STACK_MID( L2, 1);
 		ASSERT_L( lua_istable( L2, -1));
 		lua_pushlstring( L2, fqn, len);                                                      // {} "f.q.n"
 		lua_rawget( L2, -2);                                                                 // {} t
@@ -987,7 +1094,7 @@ static bool_t push_cached_table( lua_State* L2, uint_t L2_cache_i, lua_State* L,
 
 	ASSERT_L( L2_cache_i != 0);
 	STACK_GROW( L2, 3);
-	STACK_CHECK( L2);
+	STACK_CHECK( L2, 0);
 
 	// We don't need to use the from state ('L') in ID since the life span
 	// is only for the duration of a copy (both states are locked).
@@ -1027,7 +1134,7 @@ static int discover_object_name_recur( lua_State* L, int shortest_, int depth_)
 		return shortest_;
 	}
 	STACK_GROW( L, 3);
-	STACK_CHECK( L);
+	STACK_CHECK( L, 0);
 	// stack top contains the table to search in
 	lua_pushvalue( L, -1);                                  // o "r" {c} {fqn} ... {?} {?}
 	lua_rawget( L, cache);                                  // o "r" {c} {fqn} ... {?} nil/1
@@ -1170,7 +1277,7 @@ int luaG_nameof( lua_State* L)
 	}
 
 	STACK_GROW( L, 4);
-	STACK_CHECK( L);
+	STACK_CHECK( L, 0);
 	// this slot will contain the shortest name we found when we are done
 	lua_pushnil( L);                                        // o nil
 	// push a cache that will contain all already visited tables
@@ -1207,7 +1314,7 @@ static void lookup_native_func( lua_State* L2, lua_State* L, uint_t i, LookupMod
 	size_t len;
 	char const* fqn = find_lookup_name( L, i, mode_, upName_, &len);
 	// push the equivalent function in the destination's stack, retrieved from the lookup table
-	STACK_CHECK( L2);                                        // L                          // L2
+	STACK_CHECK( L2, 0);                                     // L                          // L2
 	STACK_GROW( L2, 3); // up to 3 slots are necessary on error
 	switch( mode_)
 	{
@@ -1223,7 +1330,8 @@ static void lookup_native_func( lua_State* L2, lua_State* L, uint_t i, LookupMod
 
 		case eLM_LaneBody:
 		case eLM_FromKeeper:
-		lua_getfield( L2, LUA_REGISTRYINDEX, LOOKUP_REGKEY);                                 // {}
+		REGISTRY_GET( L2, LOOKUP_REGKEY);                                                    // {}
+		STACK_MID( L2, 1);
 		ASSERT_L( lua_istable( L2, -1));
 		lua_pushlstring( L2, fqn, len);                                                      // {} "f.q.n"
 		lua_rawget( L2, -2);                                                                 // {} f
@@ -1284,13 +1392,36 @@ enum e_vt
 };
 static bool_t inter_copy_one_( Universe* U, lua_State* L2, uint_t L2_cache_i, lua_State* L, uint_t i, enum e_vt value_type, LookupMode mode_, char const* upName_);
 
+#if USE_DEBUG_SPEW
+static char const* lua_type_names[] =
+{
+	  "LUA_TNIL"
+	, "LUA_TBOOLEAN"
+	, "LUA_TLIGHTUSERDATA"
+	, "LUA_TNUMBER"
+	, "LUA_TSTRING"
+	, "LUA_TTABLE"
+	, "LUA_TFUNCTION"
+	, "LUA_TUSERDATA"
+	, "LUA_TTHREAD"
+	, "<LUA_NUMTAGS>" // not really a type
+	, "LUA_TJITCDATA" // LuaJIT specific
+};
+static char const* vt_names[] =
+{
+	"VT_NORMAL"
+	, "VT_KEY"
+	, "VT_METATABLE"
+};
+#endif // USE_DEBUG_SPEW
+
 static void inter_copy_func( Universe* U, lua_State* L2, uint_t L2_cache_i, lua_State* L, uint_t i, LookupMode mode_, char const* upName_)
 {
 	int n, needToPush;
 	luaL_Buffer b;
 	ASSERT_L( L2_cache_i != 0);                                                       // ... {cache} ... p
 	STACK_GROW( L, 2);
-	STACK_CHECK( L);
+	STACK_CHECK( L, 0);
 
 	// 'lua_dump()' needs the function at top of stack
 	// if already on top of the stack, no need to push again
@@ -1353,7 +1484,7 @@ static void inter_copy_func( Universe* U, lua_State* L2, uint_t L2_cache_i, lua_
 				// "Otherwise, it pushes an error message"
 				//
 				STACK_GROW( L, 1);
-				luaL_error( L, "%s", lua_tostring( L2, -1));
+				luaL_error( L, "%s: %s", upName_, lua_tostring( L2, -1));
 			}
 			// remove the dumped string
 			lua_pop( L, 1);                                    // ...
@@ -1447,7 +1578,7 @@ static void push_cached_func( Universe* U, lua_State* L2, uint_t L2_cache_i, lua
 
 		// L2_cache[id_str]= function
 		//
-		STACK_CHECK( L2);
+		STACK_CHECK( L2, 0);
 
 		// We don't need to use the from state ('L') in ID since the life span
 		// is only for the duration of a copy (both states are locked).
@@ -1492,7 +1623,7 @@ static bool_t push_cached_metatable( Universe* U, lua_State* L2, uint_t L2_cache
 	{
 		uint_t const mt_id = get_mt_id( U, L, -1);    // Unique id for the metatable
 
-		STACK_CHECK( L2);
+		STACK_CHECK( L2, 0);
 		STACK_GROW( L2, 4);
 		// do we already know this metatable?
 		push_registry_subtable( L2, REG_MTID);                                                                   // rst
@@ -1567,6 +1698,18 @@ static void inter_copy_keyvaluepair( Universe* U, lua_State* L2, uint_t L2_cache
 				valPath = (char*) alloca( strlen( upName_) + 32 + 3);
 				sprintf( valPath, "%s[" LUA_NUMBER_FMT "]", upName_, key);
 			}
+			else if( lua_type( L, key_i) == LUA_TLIGHTUSERDATA)
+			{
+				void* key = lua_touserdata( L, key_i);
+				valPath = (char*) alloca( strlen( upName_) + 16 + 5);
+				sprintf( valPath, "%s[U:%p]", upName_, key);
+			}
+			else if( lua_type( L, key_i) == LUA_TBOOLEAN)
+			{
+				int key = lua_toboolean( L, key_i);
+				valPath = (char*) alloca( strlen( upName_) + 8);
+				sprintf( valPath, "%s[%s]", upName_, key ? "true" : "false");
+			}
 		}
 		/*
 		* Contents of metatables are copied with cache checking;
@@ -1579,7 +1722,7 @@ static void inter_copy_keyvaluepair( Universe* U, lua_State* L2, uint_t L2_cache
 		}
 		else
 		{
-			luaL_error( L, "Unable to copy over type '%s' (in %s)", luaL_typename( L, val_i), (vt == VT_NORMAL) ? "table" : "metatable");
+			luaL_error( L, "Unable to copy %s entry '%s' because of value is of type '%s'", (vt == VT_NORMAL) ? "table" : "metatable", valPath, luaL_typename( L, val_i));
 		}
 	}
 }
@@ -1597,11 +1740,14 @@ static void inter_copy_keyvaluepair( Universe* U, lua_State* L2, uint_t L2_cache
 static bool_t inter_copy_one_( Universe* U, lua_State* L2, uint_t L2_cache_i, lua_State* L, uint_t i, enum e_vt vt, LookupMode mode_, char const* upName_)
 {
 	bool_t ret = TRUE;
-	bool_t ignore = FALSE;
 	int val_type = lua_type( L, i);
 	STACK_GROW( L2, 1);
-	STACK_CHECK( L);                                                             // L                          // L2
-	STACK_CHECK( L2);                                                            // L                          // L2
+	STACK_CHECK( L, 0);                                                          // L                          // L2
+	STACK_CHECK( L2, 0);                                                         // L                          // L2
+
+	DEBUGSPEW_CODE( fprintf( stderr, INDENT_BEGIN "inter_copy_one_()\n" INDENT_END));
+	DEBUGSPEW_CODE( ++ U->debugspew_indent_depth);
+	DEBUGSPEW_CODE( fprintf( stderr, INDENT_BEGIN "%s %s: " INDENT_END, lua_type_names[val_type], vt_names[vt]));
 
 	/* Skip the object if it has metatable with { __lanesignore = true } */
 	if( lua_getmetatable( L, i))                                                 // ... mt
@@ -1609,10 +1755,12 @@ static bool_t inter_copy_one_( Universe* U, lua_State* L2, uint_t L2_cache_i, lu
 		lua_getfield( L, -1, "__lanesignore");                                     // ... mt ignore?
 		if( lua_isboolean( L, -1) && lua_toboolean( L, -1))
 		{
+			DEBUGSPEW_CODE( fprintf( stderr, INDENT_BEGIN "__lanesignore -> LUA_TNIL\n" INDENT_END));
 			val_type = LUA_TNIL;
 		}
 		lua_pop( L, 2);                                                            // ...
 	}
+	STACK_MID( L, 0);
 
 	/* Lets push nil to L2 if the object should be ignored */
 	switch( val_type)
@@ -1620,7 +1768,11 @@ static bool_t inter_copy_one_( Universe* U, lua_State* L2, uint_t L2_cache_i, lu
 		/* Basic types allowed both as values, and as table keys */
 
 		case LUA_TBOOLEAN:
-		lua_pushboolean( L2, lua_toboolean( L, i));
+		{
+			bool_t v = lua_toboolean( L, i);
+			DEBUGSPEW_CODE( fprintf( stderr, "%s\n", v ? "true" : "false"));
+			lua_pushboolean( L2, v);
+		}
 		break;
 
 		case LUA_TNUMBER:
@@ -1629,7 +1781,7 @@ static bool_t inter_copy_one_( Universe* U, lua_State* L2, uint_t L2_cache_i, lu
 		if( lua_isinteger( L, i))
 		{
 			lua_Integer v = lua_tointeger( L, i);
-			DEBUGSPEW_CODE( if( vt == VT_KEY) fprintf( stderr, INDENT_BEGIN "KEY: " LUA_INTEGER_FMT "\n" INDENT_END, v));
+			DEBUGSPEW_CODE( fprintf( stderr, LUA_INTEGER_FMT "\n", v));
 			lua_pushinteger( L2, v);
 			break;
 		}
@@ -1637,7 +1789,7 @@ static bool_t inter_copy_one_( Universe* U, lua_State* L2, uint_t L2_cache_i, lu
 #endif // defined LUA_LNUM || LUA_VERSION_NUM >= 503
 		{
 			lua_Number v = lua_tonumber( L, i);
-			DEBUGSPEW_CODE( if( vt == VT_KEY) fprintf( stderr, INDENT_BEGIN "KEY: " LUA_NUMBER_FMT "\n" INDENT_END, v));
+			DEBUGSPEW_CODE( fprintf( stderr, LUA_NUMBER_FMT "\n", v));
 			lua_pushnumber( L2, v);
 		}
 		break;
@@ -1646,13 +1798,17 @@ static bool_t inter_copy_one_( Universe* U, lua_State* L2, uint_t L2_cache_i, lu
 		{
 			size_t len;
 			char const* s = lua_tolstring( L, i, &len);
-			DEBUGSPEW_CODE( if( vt == VT_KEY) fprintf( stderr, INDENT_BEGIN "KEY: '%s'\n" INDENT_END, s));
+			DEBUGSPEW_CODE( fprintf( stderr, "'%s'\n", s));
 			lua_pushlstring( L2, s, len);
 		}
 		break;
 
 		case LUA_TLIGHTUSERDATA:
-		lua_pushlightuserdata( L2, lua_touserdata( L, i));
+		{
+			void* p = lua_touserdata( L, i);
+			DEBUGSPEW_CODE( fprintf( stderr, "%p\n", p));
+			lua_pushlightuserdata( L2, p);
+		}
 		break;
 
 		/* The following types are not allowed as table keys */
@@ -1664,78 +1820,77 @@ static bool_t inter_copy_one_( Universe* U, lua_State* L2, uint_t L2_cache_i, lu
 			break;
 		}
 		// Allow only deep userdata entities to be copied across
-		DEBUGSPEW_CODE( fprintf( stderr, INDENT_BEGIN "USERDATA\n" INDENT_END));
+		DEBUGSPEW_CODE( fprintf( stderr, "USERDATA\n"));
 		if( copydeep( U, L, L2, i, mode_))
 		{
 			break;
 		}
 		STACK_MID( L, 0);
 
-			if( lua_getmetatable( L, i))                                             // ... mt?
+		if( lua_getmetatable( L, i))                                             // ... mt?
+		{
+			lua_getfield( L, -1, "__lanesclone");                                  // ... mt __lanesclone?
+			if( lua_isnil( L, -1))
 			{
-				lua_getfield( L, -1, "__lanesclone");                                  // ... mt __lanesclone?
-				if( lua_isnil( L, -1))
+				lua_pop( L, 2);                                                      // ...
+				ret = FALSE;
+			}
+			else
+			{
+				size_t userdata_size = 0;
+				void* const source = lua_touserdata( L, i);
+				void* clone = NULL;
+				lua_pushvalue( L, -1);                                               // ... mt __lanesclone __lanesclone
+				// call the cloning function with 0 arguments, should return the number of bytes to allocate for the clone
+				lua_call( L, 0, 1);                                                  // ... mt __lanesclone size
+				STACK_MID( L, 3);
+				userdata_size = (size_t) lua_tointeger( L, -1);                      // ... mt __lanesclone size
+				lua_pop( L, 1);                                                      // ... mt __lanesclone
+				clone = lua_newuserdata( L2, userdata_size);                                                       // ... u
+				// call cloning function in source state to perform the actual memory cloning
+				lua_pushlightuserdata( L, clone);                                    // ... mt __lanesclone clone
+				lua_pushlightuserdata( L, source);                                   // ... mt __lanesclone source
+				lua_call( L, 2, 0);                                                  // ... mt
+				STACK_MID( L, 1);
+				// copy the metatable in the target state
+				if( inter_copy_one_( U, L2, L2_cache_i, L, lua_absindex( L, -1), VT_NORMAL, mode_, upName_))       // ... u mt?
 				{
-					lua_pop( L, 2);                                                      // ...
+					lua_pop( L, 1);                                                    // ...
+					STACK_MID( L, 0);
+					// when writing to a keeper state, we have here a sentinel function with the metatable's fqn as upvalue
+					if( eLM_ToKeeper == mode_)                                                                       // ... u sentinel
+					{
+						ASSERT_L( lua_tocfunction( L2, -1) == table_lookup_sentinel);
+						// we want to create a new closure with a 'clone sentinel' function, where the upvalues are the userdata and the metatable fqn
+						lua_getupvalue( L2, -1, 1);                                                                    // ... u sentinel fqn
+						lua_remove( L2, -2);                                                                           // ... u fqn
+						lua_insert( L2, -2);                                                                           // ... fqn u
+						lua_pushcclosure( L2, userdata_clone_sentinel, 2);                                             // ... userdata_clone_sentinel
+					}
+					else // from keeper or direct, we have the userdata and the metatable
+					{
+						ASSERT_L( lua_istable( L2, -1));
+						lua_setmetatable( L2, -2);                                                                     // ... u
+					}
 				}
 				else
 				{
-					FuncSubType fst;
-					lua_CFunction cloneFunc = luaG_tocfunction( L, -1, &fst);
-					size_t userdata_size = 0;
-					void* const source = lua_touserdata( L, i);
-					void* clone = NULL;
-					lua_pushvalue( L, -1);                                               // ... mt __lanesclone __lanesclone
-					// call the cloning function with 0 arguments, should return the number of bytes to allocate for the clone
-					lua_call( L, 0, 1);                                                  // ... mt __lanesclone size
-					STACK_MID( L, 3);
-					userdata_size = (size_t) lua_tointeger( L, -1);                      // ... mt __lanesclone size
-					lua_pop( L, 1);                                                      // ... mt __lanesclone
-					clone = lua_newuserdata( L2, userdata_size);                                                       // ... u
-					// call cloning function in source state to perform the actual memory cloning
-					lua_pushlightuserdata( L, clone);                                    // ... mt __lanesclone clone
-					lua_pushlightuserdata( L, source);                                   // ... mt __lanesclone source
-					lua_call( L, 2, 0);                                                  // ... mt
-					STACK_MID( L, 1);
-					// copy the metatable in the target state
-					if( inter_copy_one_( U, L2, L2_cache_i, L, lua_absindex( L, -1), VT_NORMAL, mode_, upName_))       // ... u mt?
-					{
-						lua_pop( L, 1);                                                    // ...
-						STACK_MID( L, 0);
-						// when writing to a keeper state, we have here a sentinel function with the metatable's fqn as upvalue
-						if( eLM_ToKeeper == mode_)                                                                       // ... u sentinel
-						{
-							ASSERT_L( lua_tocfunction( L2, -1) == table_lookup_sentinel);
-							// we want to create a new closure with a 'clone sentinel' function, where the upvalues are the userdata and the metatable fqn
-							lua_getupvalue( L2, -1, 1);                                                                    // ... u sentinel fqn
-							lua_remove( L2, -2);                                                                           // ... u fqn
-							lua_insert( L2, -2);                                                                           // ... fqn u
-							lua_pushcclosure( L2, userdata_clone_sentinel, 2);                                             // ... userdata_clone_sentinel
-						}
-						else // from keeper or direct, we have the userdata and the metatable
-						{
-							ASSERT_L( lua_istable( L2, -1));
-							lua_setmetatable( L2, -2);                                                                     // ... u
-						}
-					}
-					else
-					{
-						(void) luaL_error( L, "Error copying a metatable");
-					}
+					(void) luaL_error( L, "Error copying a metatable");
 				}
-				break;
 			}
+			break;
+		}
 
-			// Not a deep or clonable full userdata
-			if( U->demoteFullUserdata) // attempt demotion to light userdata
-			{
-				void* lud = lua_touserdata( L, i);
-				lua_pushlightuserdata( L2, lud);
-			}
-			else // raise an error
-			{
-				(void) luaL_error( L, "can't copy non-deep full userdata across lanes");
-			}
+		// Not a deep or clonable full userdata
+		if( U->demoteFullUserdata) // attempt demotion to light userdata
+		{
+			void* lud = lua_touserdata( L, i);
+			lua_pushlightuserdata( L2, lud);
+		}
+		else // raise an error
+		{
+			(void) luaL_error( L, "can't copy non-deep full userdata across lanes");
+		}
 		break;
 
 		case LUA_TNIL:
@@ -1781,9 +1936,9 @@ static bool_t inter_copy_one_( Universe* U, lua_State* L2, uint_t L2_cache_i, lu
 		}
 		else
 		{
-			DEBUGSPEW_CODE( fprintf( stderr, INDENT_BEGIN "FUNCTION %s\n" INDENT_END, upName_));
+			DEBUGSPEW_CODE( fprintf( stderr, "FUNCTION %s\n", upName_));
 			DEBUGSPEW_CODE( ++ U->debugspew_indent_depth);
-			STACK_CHECK( L2);
+			STACK_CHECK( L2, 0);
 			push_cached_func( U, L2, L2_cache_i, L, i, mode_, upName_);
 			STACK_END( L2, 1);
 			DEBUGSPEW_CODE( -- U->debugspew_indent_depth);
@@ -1797,8 +1952,9 @@ static bool_t inter_copy_one_( Universe* U, lua_State* L2, uint_t L2_cache_i, lu
 			break;
 		}
 		{
-			STACK_CHECK( L);
-			STACK_CHECK( L2);
+			STACK_CHECK( L, 0);
+			STACK_CHECK( L2, 0);
+			DEBUGSPEW_CODE( fprintf( stderr, "TABLE %s\n", upName_));
 
 			/*
 			 * First, let's try to see if this table is special (aka is it some table that we registered in our lookup databases during module registration?)
@@ -1857,6 +2013,8 @@ static bool_t inter_copy_one_( Universe* U, lua_State* L2, uint_t L2_cache_i, lu
 		break;
 	}
 
+	DEBUGSPEW_CODE( -- U->debugspew_indent_depth);
+
 	STACK_END( L2, ret ? 1 : 0);
 	STACK_END( L, 0);
 	return ret;
@@ -1879,9 +2037,13 @@ int luaG_inter_copy( Universe* U, lua_State* L, lua_State* L2, uint_t n, LookupM
 	char const* pBuf = U->verboseErrors ? tmpBuf : "?";
 	bool_t copyok = TRUE;
 
+	DEBUGSPEW_CODE( fprintf( stderr, INDENT_BEGIN "luaG_inter_copy()\n" INDENT_END));
+	DEBUGSPEW_CODE( ++ U->debugspew_indent_depth);
+
 	if( n > top_L)
 	{
 		// requesting to copy more than is available?
+		DEBUGSPEW_CODE( fprintf( stderr, INDENT_BEGIN "nothing to copy()\n" INDENT_END));
 		return -1;
 	}
 
@@ -1906,6 +2068,8 @@ int luaG_inter_copy( Universe* U, lua_State* L, lua_State* L2, uint_t n, LookupM
 			break;
 		}
 	}
+
+	DEBUGSPEW_CODE( -- U->debugspew_indent_depth);
 
 	/*
 	* Remove the cache table. Persistent caching would cause i.e. multiple 
@@ -1940,8 +2104,8 @@ int luaG_inter_copy_package( Universe* U, lua_State* L, lua_State* L2, int packa
 	DEBUGSPEW_CODE( fprintf( stderr, INDENT_BEGIN "luaG_inter_copy_package()\n" INDENT_END));
 	DEBUGSPEW_CODE( ++ U->debugspew_indent_depth);
 	// package
-	STACK_CHECK( L);
-	STACK_CHECK( L2);
+	STACK_CHECK( L, 0);
+	STACK_CHECK( L2, 0);
 	package_idx_ = lua_absindex( L, package_idx_);
 	if( lua_type( L, package_idx_) != LUA_TTABLE)
 	{
@@ -1961,7 +2125,7 @@ int luaG_inter_copy_package( Universe* U, lua_State* L, lua_State* L2, int packa
 		char const* entries[] = { "path", "cpath", (mode_ == eLM_LaneBody) ? "preload" : NULL/*, (LUA_VERSION_NUM == 501) ? "loaders" : "searchers"*/, NULL};
 		for( i = 0; entries[i]; ++ i)
 		{
-			DEBUGSPEW_CODE( fprintf( stderr, INDENT_BEGIN "%s\n" INDENT_END, entries[i]));
+			DEBUGSPEW_CODE( fprintf( stderr, INDENT_BEGIN "package.%s\n" INDENT_END, entries[i]));
 			lua_getfield( L, package_idx_, entries[i]);
 			if( lua_isnil( L, -1))
 			{
@@ -2006,7 +2170,7 @@ int luaG_new_require( lua_State* L)
 	//char const* modname = luaL_checkstring( L, 1);
 
 	STACK_GROW( L, args + 1);
-	STACK_CHECK( L);
+	STACK_CHECK( L, 0);
 
 	lua_pushvalue( L, lua_upvalueindex( 1));
 	for( i = 1; i <= args; ++ i)
@@ -2035,10 +2199,10 @@ int luaG_new_require( lua_State* L)
 /*
 * Serialize calls to 'require', if it exists
 */
-void serialize_require( Universe* U, lua_State* L)
+void serialize_require( DEBUGSPEW_PARAM_COMMA( Universe* U) lua_State* L)
 {
 	STACK_GROW( L, 1);
-	STACK_CHECK( L);
+	STACK_CHECK( L, 0);
 	DEBUGSPEW_CODE( fprintf( stderr, INDENT_BEGIN "serializing require()\n" INDENT_END));
 
 	// Check 'require' is there and not already wrapped; if not, do nothing

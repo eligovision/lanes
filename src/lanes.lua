@@ -76,8 +76,7 @@ lanes.configure = function( settings_)
 		track_lanes = false,
 		demote_full_userdata = nil,
 		verbose_errors = false,
-		-- LuaJIT provides a thread-unsafe allocator by default, so we need to protect it when used in parallel lanes
-		protect_allocator = (package.loaded.jit and jit.version and package.loaded.ffi and (package.loaded.ffi.abi( "32bit") or package.loaded.ffi.abi( "gc64"))) and true or false
+		allocator = nil
 	}
 	local boolean_param_checker = function( val_)
 		-- non-'boolean-false' should be 'boolean-true' or nil
@@ -90,7 +89,10 @@ lanes.configure = function( settings_)
 			return type( val_) == "number" and val_ > 0
 		end,
 		with_timers = boolean_param_checker,
-		protect_allocator = boolean_param_checker,
+		allocator = function( val_)
+			-- can be nil, "protected", or a function
+			return val_ and (type( val_) == "function" or val_ == "protected") or true
+		end,
 		on_state_create = function( val_)
 			-- on_state_create may be nil or a function
 			return val_ and type( val_) == "function" or true
@@ -190,7 +192,7 @@ lanes.configure = function( settings_)
 	--
 	-- 'opt': .priority:  int (-3..+3) smaller is lower priority (0 = default)
 	--
-	--	      .cancelstep: bool | uint
+	--        .cancelstep: bool | uint
 	--            false: cancellation check only at pending Linda operations
 	--                   (send/receive) so no runtime performance penalty (default)
 	--            true:  adequate cancellation check (same as 100)
@@ -723,6 +725,7 @@ lanes.configure = function( settings_)
 	lanes.set_singlethreaded = core.set_singlethreaded
 	lanes.threads = core.threads or function() error "lane tracking is not available" end -- core.threads isn't registered if settings.track_lanes is false
 	lanes.set_thread_priority = core.set_thread_priority
+	lanes.set_thread_affinity = core.set_thread_affinity
 	lanes.timer = timer
 	lanes.timer_lane = timer_lane
 	lanes.timers = timers
