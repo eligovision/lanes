@@ -13,9 +13,16 @@ FIND_PROGRAM(LUA NAMES lua5.1 lua51 lua)
 FIND_PROGRAM(LUAC NAMES luac5.1 luac51 luac)
 INCLUDE_DIRECTORIES(${LUA_INCLUDE_DIR})
 
+# Options
+OPTION (LANES_COPYCLONE_VARIABLE_SIZE "Set to ON to use 1 + 2 args scheme in lanesclone mechanism against 0 + 2" OFF)
+IF (LANES_COPYCLONE_VARIABLE_SIZE)
+  ADD_DEFINITIONS(-DLANES_COPYCLONE_VARIABLE_SIZE)
+ENDIF ()
+
 if(USE_PTHREAD)
-ADD_DEFINITIONS(-DHAVE_WIN32_PTHREAD)
+  ADD_DEFINITIONS(-DHAVE_WIN32_PTHREAD)
 endif(USE_PTHREAD)
+
 #2DO - patch threading.c to suppot cygwin.
 # The following values are just a guess.
 # WARNING: test segfault under Cygwin
